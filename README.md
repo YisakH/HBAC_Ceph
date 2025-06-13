@@ -1,51 +1,20 @@
-# Ceph - a scalable distributed storage system
+# Ceph with Hierarchical-Based Access Control (HBAC)
 
-See https://ceph.com/ for current information about Ceph.
+This project is an extended version of the open-source distributed storage system, Ceph, with Hierarchical-Based Access Control (HBAC).
 
+## Introduction
 
-## Contributing Code
+This repository is based on the official Ceph functionality and has been extended to allow the application of granular access control policies according to various hierarchies within an organization (e.g., departments, teams, user groups, etc.). It provides all the features of the existing Ceph, with the addition of HBAC policy management and enforcement capabilities.
 
-Most of Ceph is dual-licensed under the LGPL version 2.1 or 3.0. Some
-miscellaneous code is either public domain or licensed under a BSD-style
-license.
+## Key Features
 
-The Ceph documentation is licensed under Creative Commons Attribution Share
-Alike 3.0 (CC-BY-SA-3.0). 
+-   Support for Hierarchical-Based Access Control (HBAC)
+-   100% compatibility with existing Ceph
+-   Enhanced policy-based data access control and auditing
 
-Some headers included in the `ceph/ceph` repository are licensed under the GPL.
-See the file `COPYING` for a full inventory of licenses by file.
-
-All code contributions must include a valid "Signed-off-by" line. See the file
-`SubmittingPatches.rst` for details on this and instructions on how to generate
-and submit patches.
-
-Assignment of copyright is not required to contribute code. Code is
-contributed under the terms of the applicable license.
-
-
-## Checking out the source
-
-Clone the ceph/ceph repository from github by running the following command on
-a system that has git installed:
-
-	git clone git@github.com:ceph/ceph
-
-Alternatively, if you are not a github user, you should run the following
-command on a system that has git installed:
-
-	git clone https://github.com/ceph/ceph.git
-
-When the `ceph/ceph` repository has been cloned to your system, run the
-following commands to move into the cloned `ceph/ceph` repository and to check
-out the git submodules associated with it:
-
-    cd ceph
-	git submodule update --init --recursive --progress
-
+---
 
 ## Build Prerequisites
-
-*section last updated 27 Jul 2023*
 
 Make sure that ``curl`` is installed. The Debian and Ubuntu ``apt`` command is
 provided here, but if you use a system with a different package manager, then

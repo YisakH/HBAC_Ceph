@@ -280,6 +280,127 @@ std::vector<std::pair<std::string, std::string>> parseStringToVector(const std::
     return result;
 }
 
+static int real_process_request(const RGWProcessEnv& penv,
+                                RGWRequest* const req,
+                                const std::string& frontend_prefix,
+                                RGWRestfulIO* const client_io,
+                                optional_yield yield,
+                                rgw::dmclock::Scheduler *scheduler,
+                                req_state* s)
+{
+    RGWOp* op = nullptr;
+    int init_error = 0;
+    RGWRESTMgr *mgr;
+    RGWHandler_REST *handler = penv.rest->get_handler(penv.driver, s,
+                                                      *penv.auth_registry,
+                                                      frontend_prefix,
+                                                      client_io, &mgr, &init_error);
+    auto guard = scope_guard([&] {
+        if (handler) {
+            handler->put_op(op);
+            penv.rest->put_handler(handler);
+        }
+    });
+
+    if (init_error != 0) {
+        dout(0) << "socks: init_error occured" <<  dendl;
+        abort_early(s, nullptr, init_error, nullptr, yield);
+        return init_error;
+    }
+    ldpp_dout(s, 10) << "handler=" << typeid(*handler).name() << dendl;
+
+    bool should_log = mgr->get_logging();
+    s->log_op(should_log);
+
+    ldpp_dout(s, 2) << "getting op " << s->op << dendl;
+    op = handler->get_op();
+    if (!op) {
+        abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler, yield);
+        return -ERR_METHOD_NOT_ALLOWED;
+    }
+    req->op = op;
+    s->op = op;
+
+    {
+        s->trace_enabled = tracing::rgw::tracer.is_enabled();
+        std::string script;
+        auto rc = rgw::lua::read_script(s, penv.lua.manager.get(), s->bucket_tenant, s->yield, rgw::lua::context::preRequest, script);
+        if (rc == -ENOENT) {
+            // no script, nothing to do
+        } else if (rc < 0) {
+            ldpp_dout(op, 5) << "WARNING: failed to read pre request script. error: " << rc << dendl;
+        } else {
+            rc = rgw::lua::request::execute(penv.driver, penv.rest, penv.olog, s, op, script);
+            if (rc < 0) {
+                ldpp_dout(op, 5) << "WARNING: failed to execute pre request script. error: " << rc << dendl;
+            }
+        }
+    }
+
+    rgw::dmclock::SchedulerCompleter c;
+    int ret;
+    std::tie(ret,c) = schedule_request(scheduler, s, op);
+    if (ret < 0) {
+        if (ret == -EAGAIN) {
+            ret = -ERR_RATE_LIMITED;
+        }
+        ldpp_dout(op,0) << "Scheduling request failed with " << ret << dendl;
+        abort_early(s, op, ret, handler, yield);
+        return ret;
+    }
+
+    ldpp_dout(op, 10) << "op=" << typeid(*op).name() << dendl;
+    s->op_type = op->get_type();
+
+    try {
+        ldpp_dout(op, 2) << "verifying requester" << dendl;
+        ret = op->verify_requester(*penv.auth_registry, yield);
+        if (ret < 0) {
+            dout(10) << "failed to authorize request" << dendl;
+            abort_early(s, op, ret, handler, yield);
+            return ret;
+        }
+
+        if (nullptr == s->auth.identity) {
+            s->auth.identity = rgw::auth::transform_old_authinfo(s);
+        }
+
+        ldpp_dout(op, 2) << "normalizing buckets and tenants" << dendl;
+        ret = handler->postauth_init(yield);
+        if (ret < 0) {
+            dout(10) << "failed to run post-auth init" << dendl;
+            abort_early(s, op, ret, handler, yield);
+            return ret;
+        }
+
+        if (s->user->get_info().suspended) {
+            dout(10) << "user is suspended, uid=" << s->user->get_id() << dendl;
+            abort_early(s, op, -ERR_USER_SUSPENDED, handler, yield);
+            return -ERR_USER_SUSPENDED;
+        }
+
+        s->http_params = parseStringToVector(s->info.request_params);
+
+        for (auto &param : s->http_params) {
+            dout(0) << "socks : param : " << param.first << " : " << param.second << dendl;
+        }
+
+        s->trace = tracing::rgw::tracer.start_trace(op->name(), s->trace_enabled);
+        s->trace->SetAttribute(tracing::rgw::TRANS_ID, s->trans_id);
+
+        ret = rgw_process_authenticated(handler, op, req, s, yield, penv.driver);
+        if (ret < 0) {
+            abort_early(s, op, ret, handler, yield);
+            return ret;
+        }
+    } catch (const ceph::crypto::DigestException& e) {
+        dout(0) << "authentication failed" << e.what() << dendl;
+        abort_early(s, op, -ERR_INVALID_SECRET_KEY, handler, yield);
+        return -ERR_INVALID_SECRET_KEY;
+    }
+    return 0;
+}
+
 int process_request(const RGWProcessEnv& penv,
                     RGWRequest* const req,
                     const std::string& frontend_prefix,
@@ -290,137 +411,148 @@ int process_request(const RGWProcessEnv& penv,
                     ceph::coarse_real_clock::duration* latency,
                     int* http_ret)
 {
-  int ret = client_io->init(g_ceph_context);
   dout(1) << "====== starting new request req=" << hex << req << dec
 	  << " =====" << dendl;
   perfcounter->inc(l_rgw_req);
 
   RGWEnv& rgw_env = client_io->get_env();
-
   req_state rstate(g_ceph_context, penv, &rgw_env, req->id);
   req_state *s = &rstate;
-
   s->ratelimit_data = penv.ratelimiting->get_active();
 
   rgw::sal::Driver* driver = penv.driver;
   std::unique_ptr<rgw::sal::User> u = driver->get_user(rgw_user());
   s->set_user(u);
 
-  if (ret < 0) {
-    s->cio = client_io;
-    abort_early(s, nullptr, ret, nullptr, yield);
-    return ret;
-  }
-
-  s->req_id = driver->zone_unique_id(req->id);
-  s->trans_id = driver->zone_unique_trans_id(req->id);
-  s->host_id = driver->get_host_id();
-  s->yield = yield;
-
-  ldpp_dout(s, 2) << "initializing for trans_id = " << s->trans_id << dendl;
-
+  int ret = 0;
   RGWOp* op = nullptr;
-  int init_error = 0;
+  RGWHandler_REST *handler = nullptr;
   bool should_log = false;
   RGWREST* rest = penv.rest;
-  RGWRESTMgr *mgr;
-  RGWHandler_REST *handler = rest->get_handler(driver, s,
-                                               *penv.auth_registry,
-                                               frontend_prefix,
-                                               client_io, &mgr, &init_error);
-  rgw::dmclock::SchedulerCompleter c;
-  string tmp = s->decoded_uri;
-  if (init_error != 0) {
-    dout(0) << "socks: init_error occured" <<  dendl;
-    abort_early(s, nullptr, init_error, nullptr, yield);
-    goto done;
-  }
-  ldpp_dout(s, 10) << "handler=" << typeid(*handler).name() << dendl;
 
-  should_log = mgr->get_logging();
-  ldpp_dout(s, 2) << "getting op " << s->op << dendl;
-  op = handler->get_op();
-  if (!op) {
-    abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler, yield);
-    goto done;
-  }
-  {
-    s->trace_enabled = tracing::rgw::tracer.is_enabled();
-    std::string script;
-    auto rc = rgw::lua::read_script(s, penv.lua.manager.get(), s->bucket_tenant, s->yield, rgw::lua::context::preRequest, script);
-    if (rc == -ENOENT) {
-      // no script, nothing to do
-    } else if (rc < 0) {
-      ldpp_dout(op, 5) << "WARNING: failed to read pre request script. error: " << rc << dendl;
-    } else {
-      rc = rgw::lua::request::execute(driver, rest, penv.olog, s, op, script);
-      if (rc < 0) {
-        ldpp_dout(op, 5) << "WARNING: failed to execute pre request script. error: " << rc << dendl;
+  auto guard = scope_guard([&] {
+      if (handler) {
+          handler->put_op(op);
+          rest->put_handler(handler);
+      }
+  });
+
+  do {
+    ret = client_io->init(g_ceph_context);
+    if (ret < 0) {
+        s->cio = client_io;
+        abort_early(s, nullptr, ret, nullptr, yield);
+        break;
+    }
+    s->req_id = driver->zone_unique_id(req->id);
+    s->trans_id = driver->zone_unique_trans_id(req->id);
+    s->host_id = driver->get_host_id();
+    s->yield = yield;
+    ldpp_dout(s, 2) << "initializing for trans_id = " << s->trans_id << dendl;
+
+    int init_error = 0;
+    RGWRESTMgr *mgr;
+    handler = rest->get_handler(driver, s,
+                                *penv.auth_registry,
+                                frontend_prefix,
+                                client_io, &mgr, &init_error);
+    if (init_error != 0) {
+      dout(0) << "socks: init_error occured" <<  dendl;
+      abort_early(s, nullptr, init_error, nullptr, yield);
+      ret = init_error;
+      break;
+    }
+    ldpp_dout(s, 10) << "handler=" << typeid(*handler).name() << dendl;
+
+    should_log = mgr->get_logging();
+    ldpp_dout(s, 2) << "getting op " << s->op << dendl;
+    op = handler->get_op();
+    req->op = op;
+    s->op = op;
+
+    if (!op) {
+      abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED, handler, yield);
+      ret = -ERR_METHOD_NOT_ALLOWED;
+      break;
+    }
+    {
+      s->trace_enabled = tracing::rgw::tracer.is_enabled();
+      std::string script;
+      auto rc = rgw::lua::read_script(s, penv.lua.manager.get(), s->bucket_tenant, s->yield, rgw::lua::context::preRequest, script);
+      if (rc == -ENOENT) {
+        // no script, nothing to do
+      } else if (rc < 0) {
+        ldpp_dout(op, 5) << "WARNING: failed to read pre request script. error: " << rc << dendl;
+      } else {
+        rc = rgw::lua::request::execute(driver, rest, penv.olog, s, op, script);
+        if (rc < 0) {
+          ldpp_dout(op, 5) << "WARNING: failed to execute pre request script. error: " << rc << dendl;
+        }
       }
     }
-  }
-  std::tie(ret,c) = schedule_request(scheduler, s, op);
-  if (ret < 0) {
-    if (ret == -EAGAIN) {
-      ret = -ERR_RATE_LIMITED;
-    }
-    ldpp_dout(op,0) << "Scheduling request failed with " << ret << dendl;
-    abort_early(s, op, ret, handler, yield);
-    goto done;
-  }
-  req->op = op;
-  ldpp_dout(op, 10) << "op=" << typeid(*op).name() << dendl;
-  s->op_type = op->get_type();
-
-  try {
-    ldpp_dout(op, 2) << "verifying requester" << dendl;
-    ret = op->verify_requester(*penv.auth_registry, yield);
+    rgw::dmclock::SchedulerCompleter c;
+    std::tie(ret,c) = schedule_request(scheduler, s, op);
     if (ret < 0) {
-      dout(10) << "failed to authorize request" << dendl;
+      if (ret == -EAGAIN) {
+        ret = -ERR_RATE_LIMITED;
+      }
+      ldpp_dout(op,0) << "Scheduling request failed with " << ret << dendl;
       abort_early(s, op, ret, handler, yield);
-      goto done;
+      break;
     }
 
-    /* FIXME: remove this after switching all handlers to the new authentication
-     * infrastructure. */
-    if (nullptr == s->auth.identity) {
-      s->auth.identity = rgw::auth::transform_old_authinfo(s);
+    ldpp_dout(op, 10) << "op=" << typeid(*op).name() << dendl;
+    s->op_type = op->get_type();
+
+    try {
+      ldpp_dout(op, 2) << "verifying requester" << dendl;
+      ret = op->verify_requester(*penv.auth_registry, yield);
+      if (ret < 0) {
+        dout(10) << "failed to authorize request" << dendl;
+        abort_early(s, op, ret, handler, yield);
+        break;
+      }
+
+      if (nullptr == s->auth.identity) {
+        s->auth.identity = rgw::auth::transform_old_authinfo(s);
+      }
+
+      ldpp_dout(op, 2) << "normalizing buckets and tenants" << dendl;
+      ret = handler->postauth_init(yield);
+      if (ret < 0) {
+        dout(10) << "failed to run post-auth init" << dendl;
+        abort_early(s, op, ret, handler, yield);
+        break;
+      }
+
+      if (s->user->get_info().suspended) {
+        dout(10) << "user is suspended, uid=" << s->user->get_id() << dendl;
+        abort_early(s, op, -ERR_USER_SUSPENDED, handler, yield);
+        ret = -ERR_USER_SUSPENDED;
+        break;
+      }
+
+      s->http_params = parseStringToVector(s->info.request_params);
+
+      for (auto &param : s->http_params) {
+        dout(0) << "socks : param : " << param.first << " : " << param.second << dendl;
+      }
+
+      s->trace = tracing::rgw::tracer.start_trace(op->name(), s->trace_enabled);
+      s->trace->SetAttribute(tracing::rgw::TRANS_ID, s->trans_id);
+
+      ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
+      if (ret < 0) {
+        abort_early(s, op, ret, handler, yield);
+        break;
+      }
+    } catch (const ceph::crypto::DigestException& e) {
+      dout(0) << "authentication failed" << e.what() << dendl;
+      abort_early(s, op, -ERR_INVALID_SECRET_KEY, handler, yield);
+      ret = -ERR_INVALID_SECRET_KEY;
     }
+  } while(false);
 
-    ldpp_dout(op, 2) << "normalizing buckets and tenants" << dendl;
-    ret = handler->postauth_init(yield);
-    if (ret < 0) {
-      dout(10) << "failed to run post-auth init" << dendl;
-      abort_early(s, op, ret, handler, yield);
-      goto done;
-    }
-
-    if (s->user->get_info().suspended) {
-      dout(10) << "user is suspended, uid=" << s->user->get_id() << dendl;
-      abort_early(s, op, -ERR_USER_SUSPENDED, handler, yield);
-      goto done;
-    }
-
-    s->http_params = parseStringToVector(s->info.request_params);
-
-    for (auto &param : s->http_params) {
-      dout(0) << "socks : param : " << param.first << " : " << param.second << dendl;
-    }
-
-    s->trace = tracing::rgw::tracer.start_trace(op->name(), s->trace_enabled);
-    s->trace->SetAttribute(tracing::rgw::TRANS_ID, s->trans_id);
-
-    ret = rgw_process_authenticated(handler, op, req, s, yield, driver);
-    if (ret < 0) {
-      abort_early(s, op, ret, handler, yield);
-      goto done;
-    }
-  } catch (const ceph::crypto::DigestException& e) {
-    dout(0) << "authentication failed" << e.what() << dendl;
-    abort_early(s, op, -ERR_INVALID_SECRET_KEY, handler, yield);
-  }
-
-done:
   if (op) {
     if (s->trace) {
       s->trace->SetAttribute(tracing::rgw::OP_RESULT, op->get_ret());
@@ -476,9 +608,6 @@ done:
   } else {
     ldpp_dout(s, 2) << "http status=" << s->err.http_ret << dendl;
   }
-  if (handler)
-    handler->put_op(op);
-  rest->put_handler(handler);
 
   const auto lat = s->time_elapsed();
   if (latency) {
@@ -492,5 +621,5 @@ done:
 	  << dendl;
 
   return (ret < 0 ? ret : s->err.ret);
-} /* process_request */
+}
 

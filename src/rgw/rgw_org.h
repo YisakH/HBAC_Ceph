@@ -12,6 +12,7 @@
 #include <utility>
 #include <nlohmann/json.hpp>
 #include <filesystem>
+#include <memory>
 
 #define RGW_ORG_TIER_NOT_ALLOWED 30002
 #define RGW_ORG_PERMISSION_NOT_ALLOWED 30003
@@ -180,17 +181,17 @@ public:
     std::string user;
     std::string authorizer;
     int tier;
-    OrgPermissionFlags* orgPermissionFlags;
+    std::unique_ptr<OrgPermissionFlags> orgPermissionFlags;
     RGWOrg(std::string user, const std::string &authorizer, uint16_t tier,
-           OrgPermissionFlags* orgPermission) : user(std::move(user)), authorizer(authorizer), tier(tier),
-                                                orgPermissionFlags(orgPermission) {}
+           std::unique_ptr<OrgPermissionFlags> orgPermission) : user(std::move(user)), authorizer(authorizer), tier(tier),
+                                                orgPermissionFlags(std::move(orgPermission)) {}
 
     RGWOrg(std::string user, const std::string &authorizer, uint16_t tier) : user(std::move(user)), authorizer(authorizer),
                                                                                      tier(tier){
-                                                                                        orgPermissionFlags = new OrgPermissionFlags();
+                                                                                        orgPermissionFlags = std::make_unique<OrgPermissionFlags>();
                                                                                      }
     RGWOrg(){
-        orgPermissionFlags = new OrgPermissionFlags();
+        orgPermissionFlags = std::make_unique<OrgPermissionFlags>();
         user = "";
         authorizer = "";
         tier = -1;
@@ -210,7 +211,7 @@ public:
     }
 
     OrgPermissionFlags* getOrgPermission() const {
-        return orgPermissionFlags;
+        return orgPermissionFlags.get();
     }
 
     void setUser(const std::string &user) {
@@ -225,8 +226,8 @@ public:
         RGWOrg::tier = tier;
     }
 
-    void setOrgPermission(OrgPermissionFlags &newOrgPermission) {
-        orgPermissionFlags = &newOrgPermission;
+    void setOrgPermission(std::unique_ptr<OrgPermissionFlags> newOrgPermission) {
+        orgPermissionFlags = std::move(newOrgPermission);
     }
 
     int putRGWOrg();
@@ -240,6 +241,9 @@ public:
     nlohmann::json toJson();
 
     static int getPartialMatchRgwOrg(const std::string& user, const std::string& path, RGWOrg *rgwOrg);
+
+    static int deleteWithAncestor(const std::string &user);
+    static int deleteWithBoth(const std::string &user, const std::string &anc, const std::vector<std::string> &dec_list);
 };
 
 
@@ -342,7 +346,7 @@ public:
     static int deleteWithBoth(const std::string &user, const std::string &anc, const std::vector<std::string> &dec_list);
 };
 
-RGWOrg* getAcl(const std::string& user, const std::string& path, bool isFullMatch = false);
+std::unique_ptr<RGWOrg> getAcl(const std::string& user, const std::string& path, bool isFullMatch = false);
 int putAcl(const std::string& user, const std::string& path, const std::string& authorizer, int tier, bool get, bool put, bool del, bool gra);
 int deleteAcl(const std::string& request_user, const std::string& user, const std::string& path);
 int checkAclWrite(const std::string& request_user, const std::string& user, const std::string& path, const std::string& authorizer, int tier, bool get, bool put, bool del, bool gra);

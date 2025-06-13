@@ -11,6 +11,7 @@
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <queue>
+#include <nlohmann/json.hpp>
 
 // TierDB RGWOrgTier::tierDb;
 bool OrgPermissionFlags::operator<=(const OrgPermissionFlags& other) const {
@@ -74,7 +75,7 @@ RGWOrg::RGWOrg(const std::string &user, const std::string &authorizer){
     this->authorizer = authorizer;
 
     RGWOrgTier::getUserTier(user, &this->tier);
-    orgPermissionFlags = new OrgPermissionFlags();
+    orgPermissionFlags = std::make_unique<OrgPermissionFlags>();
 }                                   
 
 int DBManager::getData(const std::string &key, std::string &value)
@@ -190,7 +191,7 @@ int RGWOrgAnc::getAnc(const std::string &user, std::string *anc)
 
 int toRGWOrg(const std::string &key, const std::string &value, RGWOrg *rgwOrg)
 {
-    rgwOrg->orgPermissionFlags = new OrgPermissionFlags();
+    rgwOrg->orgPermissionFlags = std::make_unique<OrgPermissionFlags>();
 
     std::istringstream iss(key);
     std::string token;
@@ -295,14 +296,14 @@ int RGWOrg::getFullMatchRGWOrg(const std::string& key, RGWOrg *rgwOrg)
 // acl을 받아 오는 함수
 // isFullMatch = true: 정확하게 일치하는 acl을 받아옴
 // isFullMatch = false: 가장 근사하게 일치하는 acl을 받아옴 (path가 가장 긴 acl)
-RGWOrg *getAcl(const std::string &user, const std::string &path, bool isFullMatch)
+std::unique_ptr<RGWOrg> getAcl(const std::string &user, const std::string &path, bool isFullMatch)
 {
-    auto *rgwOrg = new RGWOrg();
+    auto rgwOrg = std::make_unique<RGWOrg>();
     int ret;
     if (isFullMatch)
-        ret = RGWOrg::getFullMatchRGWOrg(user + ":" + path, rgwOrg);
+        ret = RGWOrg::getFullMatchRGWOrg(user + ":" + path, rgwOrg.get());
     else{
-        ret = RGWOrg::getPartialMatchRgwOrg(user, path, rgwOrg);
+        ret = RGWOrg::getPartialMatchRgwOrg(user, path, rgwOrg.get());
     }
     if (ret < 0)
     {
@@ -329,15 +330,13 @@ int putAcl(const std::string &user, const std::string &path, const std::string &
 
     auto rgwOrg = std::make_unique<RGWOrg>(user, authorizer, tier);
     auto orgPermission = std::make_unique<OrgPermissionFlags>(get, put, del, gra, path);
-    rgwOrg->setOrgPermission(*orgPermission);
+    rgwOrg->setOrgPermission(std::move(orgPermission));
 
-    RGWOrg *existingRgwOrg = getAcl(user, path);
+    auto existingRgwOrg = getAcl(user, path);
     if (existingRgwOrg != nullptr) {
         if (existingRgwOrg->getTier() < tier) {
-            delete existingRgwOrg;
             return -1; // 기존 권한의 티어가 더 낮으면 실패
         }
-        delete existingRgwOrg;
     }
 
     // 기존 상위 경로에 대한 권한
@@ -362,18 +361,16 @@ int putAcl(const std::string &user, const std::string &path, const std::string &
     getAnc(user, &anc);
     if (!anc.empty()) {
         // anc의 권한 조회
-        RGWOrg *ancRgwOrg = getAcl(anc, path);
+        auto ancRgwOrg = getAcl(anc, path);
         if (ancRgwOrg != nullptr) {
-            if (*orgPermission <= *ancRgwOrg->getOrgPermission()) {
+            if (*(rgwOrg->getOrgPermission()) <= *ancRgwOrg->getOrgPermission()) {
                 // 상위 유저의 권한이 충분하면 putAcl 수행하지 않음
             } else { // 상위 유저가 충분한 권한이 없는 경우
                 int ret = putAcl(anc, path, authorizer, tier, get, put, del, gra);
                 if (ret < 0) {
-                    delete ancRgwOrg;
                     return ret;
                 }
             }
-            delete ancRgwOrg;
         } else {
             int ret = putAcl(anc, path, authorizer, tier, get, put, del, gra);
             if (ret < 0) {
@@ -418,7 +415,7 @@ int deleteAcl(const std::string &request_user, const std::string &user, const st
     }
 
     std::string key = user + ":" + path;
-    RGWOrg *rgwOrg = getAcl(user, path, true);
+    auto rgwOrg = getAcl(user, path, true);
     if (rgwOrg == nullptr) {
         return -RGW_ORG_KEY_NOT_FOUND;
     }
@@ -696,7 +693,7 @@ int checkAclWrite(const std::string& request_user, const std::string& target_use
         return -RGW_ORG_TIER_NOT_ALLOWED;
     }
 
-    RGWOrg * request_user_org = getAcl(request_user, path);
+    auto request_user_org = getAcl(request_user, path);
     //std::string tmp = request_user_org->toString();
     if(request_user_org == nullptr || !request_user_org->getOrgPermission()->gra){ // grant 권한이 없는 경우
         return -RGW_ORG_PERMISSION_NOT_ALLOWED;
@@ -711,7 +708,7 @@ int checkAclWrite(const std::string& request_user, const std::string& target_use
         return -RGW_ORG_PERMISSION_ALLOWED;
     }
 
-    RGWOrg *rgwOrg = getAcl(anc_user, path);
+    auto rgwOrg = getAcl(anc_user, path);
 
     if(rgwOrg != nullptr){
         OrgPermissionFlags *ancPermission = rgwOrg->getOrgPermission();
@@ -733,7 +730,7 @@ int checkAclWrite(const std::string& request_user, const std::string& target_use
 
 int checkHAclObjRead(const std::string& request_user, const std::string& bucket_name, const std::string& object_name){
     const std::string path = getObjectPath(bucket_name, object_name);
-    RGWOrg *rgwOrg = getAcl(request_user, path, false);
+    auto rgwOrg = getAcl(request_user, path, false);
     if(rgwOrg == nullptr){
         return -RGW_ORG_PERMISSION_ALLOWED;
     }
@@ -748,7 +745,7 @@ int checkHAclObjRead(const std::string& request_user, const std::string& bucket_
 
 int checkHAclObjWrite(const std::string& request_user, const std::string& bucket_name, const std::string& object_name){
     const std::string path = getObjectPath(bucket_name, object_name);
-    RGWOrg *rgwOrg = getAcl(request_user, path, false);
+    auto rgwOrg = getAcl(request_user, path, false);
     if(rgwOrg == nullptr){
         return -RGW_ORG_KEY_NOT_FOUND;
     }
@@ -1105,7 +1102,7 @@ int RGWOrgTier::updateUserTier(const std::string &start_user){
 }
 
 bool validateRGWOrgPermission(std::string user, std::string path, bool get, bool put, bool del, bool gra){
-    RGWOrg *rgwOrg = getAcl(user, path);
+    auto rgwOrg = getAcl(user, path);
     if(rgwOrg == nullptr){
         return false;
     }
@@ -1144,12 +1141,12 @@ int AclDB::getAllPartialMatchAcl(const std::string& prefix, std::vector<std::pai
     }
 
     for (auto &pair : str_values) {
-        std::string key = pair.first;
-        std::string value = pair.second;
-        RGWOrg *rgwOrg = new RGWOrg();
-        ret = toRGWOrg(key, value, rgwOrg);
+        RGWOrg rgwOrg;
+        ret = toRGWOrg(pair.first, pair.second, &rgwOrg);
 
-        values.push_back(std::make_pair(key, *rgwOrg));
+        if (ret == 0) {
+            values.push_back(std::make_pair(pair.first, std::move(rgwOrg)));
+        }
     }
     return 0;
 }
@@ -1289,7 +1286,7 @@ int checkAclPermission(const std::string& request_user,
                     const bool del, 
                     const bool gra, 
                     const std::string& path){
-    RGWOrg *rgwOrg = getAcl(request_user, path);
+    auto rgwOrg = getAcl(request_user, path);
     if(rgwOrg == nullptr){
         return -RGW_ORG_KEY_NOT_FOUND;
     }
